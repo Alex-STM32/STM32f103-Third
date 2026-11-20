@@ -1,0 +1,11 @@
+# 构建产物
+cmake-build-*/
+build/
+# IDE 临时文件
+.idea/workspace.xml
+.idea/shelf/
+# 编译中间文件
+*.o
+*.obj
+*.su
+*.d
