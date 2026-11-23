@@ -79,6 +79,7 @@ STATE=RUN,DIR=FWD,STEP=300,LED=1\r\n
 - 屏幕：SSD1306 128×64，I²C 地址 0x78（写）。
 - **软件 I²C**：不占用硬件 I²C 外设，直接用 GPIO 推挽输出按 I²C 时序翻转 SCL/SDA（每位数据在 SCL 高电平期间保持稳定，第 9 个时钟释放 SDA 忽略 ACK）。位延时约 0.6~0.8µs，满足 SSD1306 时序要求。
 - 驱动分层：`Core/Src/oled.c` + `Core/Inc/oled.h`（时序、初始化、显存写入、字符/字符串显示），`Core/Inc/oledfont.h`（8×16 ASCII 点阵字模）。
+- **硬件 I²C 版本**：见第十节（选做）。两份驱动对外接口完全一致（`OLED_Init` / `OLED_Clear` / `OLED_ShowChar` / `OLED_ShowString` / `OLED_ClearArea`），`main.c` 不需要任何改动，只靠编译宏切换底层。
 - 显示内容四行，8×16 字体：
 
 ```
@@ -100,10 +101,16 @@ LED: 1
 
 ## 六、选做部分说明
 
-本次**未实现选做**：
+本次**完成了“使用硬件 I²C 驱动 OLED 屏幕”的选做**，并且按选做要求保留了软件 I²C 版本——仓库里同时提交两份驱动代码：
 
-- 未实现硬件 I²C 版本 OLED（按要求仍以软件 I²C 为提交版本）；
-- 串口反馈使用基础要求的中断发送 `HAL_UART_Transmit_IT()`，未改为 DMA 发送。
+| 版本 | 驱动文件 | 使用的引脚 | 编译默认 |
+|---|---|---|---|
+| 软件模拟 I²C | `Core/Src/oled.c` | SDA = PB0，SCL = PB1 | 是（不加宏） |
+| 硬件 I²C1 | `Core/Src/oled_hw.c` | SDA = PB7，SCL = PB6 | 否（加 `-DOLED_USE_HW_I2C=1`） |
+
+两份代码共用同一个头文件 `Core/Inc/oled.h` 和字模 `Core/Inc/oledfont.h`，接口完全相同，切换只改一个宏，详见第十节。
+
+串口反馈仍使用基础要求的中断发送 `HAL_UART_Transmit_IT()`，没有另做 DMA 发送。
 
 ## 七、思考题回答
 
@@ -173,3 +180,101 @@ __HAL_AFIO_REMAP_SWJ_DISABLE();   /* 上电即关闭 JTAG 和 SWD */
 ### 验证方法说明
 
 上述每一项都通过 SWD 直接读取芯片 RAM 中的变量核对，而不是只看现象：`interval_ms`、`run_flag`、`dir_flag`、`led_index`、`uart_ok/bad/err`、`oled_ack_ok/ack_fail`、以及 GPIO 输入寄存器 `GPIOx_IDR` 的实际电平。例如发送 `AA 00 01 C8 00 73` 后读回 `interval_ms = 0xC8 (200)`，即证明数据包被正确解析并执行。
+## 十、选做：使用硬件 I²C 驱动 OLED（第二份代码）
+
+### 1. 两种驱动怎么共存
+
+选做要求"就算选择硬件 I²C，软件 I²C 同样需要完成，提交时提交两份代码"。本仓库的做法不是把两个工程各存一份，而是在**同一个工程里放两份驱动**，用编译宏二选一：
+
+| 文件 | 内容 | 何时参与编译 |
+|---|---|---|
+| `Core/Src/oled.c` | 软件模拟 I²C（GPIO 翻转电平） | `OLED_USE_HW_I2C` 为 0（默认） |
+| `Core/Src/oled_hw.c` | 硬件 I²C1（STM32 外设产生时序） | `OLED_USE_HW_I2C` 为 1 |
+| `Core/Inc/oled.h` | 两个版本共用的声明、引脚、诊断变量 | 始终 |
+| `Core/Inc/oledfont.h` | 8×16 点阵字模 | 始终（只在被选中的那个 .c 里包含） |
+
+两个 `.c` 文件第一行都套了 `#if` 守卫，且 **`#if` 写在 `#include` 之前**——因为 `oledfont.h` 里是数组的"定义"而不是 `extern` 声明，两个文件同时包含就会在链接期报 `F8X16 multiple definition`。这一点在实际编译时踩到过。
+
+两份驱动对外接口完全一致，所以 `main.c` 一行都不用改，两种底层的差异被完全封装在驱动内部。
+
+### 2. 接线差异
+
+| 信号 | 软件 I²C 版 | 硬件 I²C 版 |
+|---|---|---|
+| OLED VCC | 3.3V | 3.3V |
+| OLED GND | GND | GND |
+| SCL | PB1 | **PB6** |
+| SDA | PB0 | **PB7** |
+
+换版本时两根杜邦线必须跟着换位置，否则屏幕不亮（`oled_addr_found` 会读到 0，说明两个地址都没有应答）。
+
+### 3. 原理对比
+
+| 对比项 | 软件模拟 I²C | 硬件 I²C1 |
+|---|---|---|
+| 时序由谁产生 | CPU 用循环加延时逐个翻电平，每字节 CPU 跑 8 次循环 | I²C 外设的移位状态机自动产生起止位、8 个时钟和第 9 个应答时钟 |
+| CPU 占用 | 每个字节全程占用 CPU | 只有调用 `HAL_I2C_Master_Transmit` 前后参与，中间由硬件完成 |
+| 速率 | 由延时循环决定，本工程约 150kHz | 400kHz 快速模式（SSD1306 上限） |
+| 引脚模式 | `GPIO_MODE_OUTPUT_OD`（普通开漏输出） | `GPIO_MODE_AF_OD`（**复用开漏**） |
+| 抗干扰/稳定性 | 时序受主循环其他代码影响（被中断打断就会拉长电平时间） | 时序由硬件保证，不受主循环影响 |
+| 出错处理 | 读回 SDA 判 ACK、计数 `oled_ack_ok/ack_fail` | HAL 返回状态码；`HAL_BUSY`/超时时 `HAL_I2C_DeInit` + 重新 `HAL_I2C_Init` 复位外设，计数 `oled_bus_err` |
+
+**为什么硬件版必须用"复用开漏"而不是推挽**：I²C 总线是线与结构，所有器件只能"拉低"或"释放"。若用推挽输出，一方输出高、另一方输出低就是电源直接对地短路。开漏模式下高电平靠上拉电阻产生，多方同时驱动也不会冲突，这是 I²C 电气规范的硬性要求。
+
+### 4. 硬件版的关键实现点
+
+1. **外设初始化**：开 `GPIOB` 与 `I2C1` 时钟 → PB6/PB7 配 `AF_OD` → `HAL_I2C_Init` 设 400kHz、7 位地址、单主机。I2C1 在 F103 上默认映射就是 PB6/PB7，不需要 AFIO 重映射。
+2. **控制字节**：SSD1306 的每次写传输都以"地址 + 写位（0x78）"开头，第二个字节是控制字节——`0x00` 表示后面是命令、`0x40` 表示后面是显存数据。硬件 I²C 一次 `Master_Transmit` 就能把"控制字节 + 一整页 128 列数据"整包发完，不像软件版那样每个字节都要 CPU 打一拍时钟。
+3. **地址探测**：用 `HAL_I2C_IsDeviceReady()` 分别试 `0x78` 与 `0x7A`，哪个有 ACK 就用哪个，结果写进 `oled_addr_found`（1/2/0）。
+4. **卡死恢复**：F1 的 I²C 在异常后容易停在 `BUSY`，之后每次调用直接返回 `HAL_BUSY`。驱动里遇到 `HAL_BUSY`/`HAL_TIMEOUT` 就 `DeInit` 再 `Init`（相当于复位外设），并累加 `oled_bus_err` 留证据；NACK 属于接线/地址问题，复位没用，不触发复位。
+5. **缓冲区**：`static uint8_t s_txbuf[1 + 128]`（控制字节 + 一整页），放在静态区而不是栈上，避免 129 字节压在 1KB 栈上。
+
+### 5. 两份固件的编译方法
+
+软件 I²C 版（默认，也是基础要求验收用的版本）：
+
+```powershell
+cmake -S . -B cmake-build-debug -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Debug
+cmake --build cmake-build-debug -j 8
+```
+
+硬件 I²C 版（只多一个宏，源码不做任何改动）：
+
+```powershell
+cmake -S . -B cmake-build-hw -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="-DOLED_USE_HW_I2C=1"
+cmake --build cmake-build-hw -j 8
+```
+
+在 CLion 里的等效做法：`Settings → CMake → CMake options` 里加 `-DCMAKE_C_FLAGS=-DOLED_USE_HW_I2C=1`，或在 `CMakeLists.txt` 里 `add_compile_definitions(OLED_USE_HW_I2C=1)`。
+
+> **注意：工程已不再用 CubeMX 重新生成代码。** 硬件 I²C 是用代码手写的（`ioc` 里没有勾选 I2C1），所以 `stm32f1xx_hal_conf.h` 里的 `HAL_I2C_MODULE_ENABLED` 与 `Drivers/` 下的 `stm32f1xx_hal_i2c.c/.h` 是手工补进来的。如果再用 CubeMX 点「GENERATE CODE」，这三处会被按 `ioc` 现状覆盖掉，硬件版会编译不过。要重新生成就必须先在 CubeMX 里勾上 I2C1（PB6/PB7）再生成。
+
+### 6. 两份固件的大小对比
+
+| 版本 | RAM | FLASH | 说明 |
+|---|---|---|---|
+| 软件 I²C（默认） | 4344 B | 40900 B | 与基础版本完全一致，未因新增硬件版代码变大 |
+| 硬件 I²C1 | 4560 B | 42812 B | 多出约 216 B RAM（I²C 句柄 80 B + 发送缓冲 129 B）与约 1.9 KB FLASH（HAL I²C 驱动） |
+
+**代码互斥核验**（用 `arm-none-eabi-nm` 对比两个 elf）：
+
+- 硬件版链接了 `HAL_I2C_Master_Transmit`、`HAL_I2C_IsDeviceReady`，**没有** `I2C_WriteByte`（软件位翻转函数）；
+- 软件版链接了 `I2C_WriteByte`，**没有**任何 `HAL_I2C_*` 符号。
+
+说明两份代码确实是两套独立的实现，通过编译期开关互斥地进入固件，而不是同一套代码换个名字。
+
+### 7. 硬件版实测结论
+
+烧入 `cmake-build-hw/Third.elf`、OLED 改接 PB6/PB7 后，用 SWD 直接读芯片 RAM 中的变量核对（不是只看现象）：
+
+| 变量 | 读回值 | 说明 |
+|---|---|---|
+| `oled_addr_found` | 1 | `0x78` 有应答，地址探测成功 |
+| `oled_bus_err` | 0 | 全程没有 BUSY/超时，外设一次都没被迫复位 |
+| `oled_ack_fail` | 0 | 没有一次失败的传输 |
+| `oled_ack_ok` | 27737 → 30297 → 32857 → 35417（1.5 秒采样一次） | 传输持续进行，说明屏幕在被持续刷新 |
+| `GPIOA_ODR` | 0xB804 → 0xB802 → 0xB801 → 0xB804 | PA0~PA2 同一时刻只有一位为 1 且在轮转，流水灯正常 |
+| `run_flag` / `interval_ms` | 0x01 / 0x012C（300） | 运行、300ms，串口下发的状态照常生效 |
+
+结论：**硬件 I²C 版本与软件版功能完全一致**——四行状态显示、状态变化即时刷新、流水灯、串口数据包控制全部照常工作，差别只在"时序由 I²C1 外设产生"这一层。`oled_ack_ok` 在 6 秒内增长约 7700 次、`fail` 与 `bus_err` 始终为 0，说明 400kHz 下长时间运行没有出现 F1 硬件 I²C 常见的 BUSY 卡死。
+

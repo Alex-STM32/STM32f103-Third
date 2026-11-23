@@ -17,6 +17,13 @@
   ******************************************************************************
   */
 
+/* 本文件是"软件模拟 I²C"版本。选做要求两份代码都要有：
+   硬件 I²C 版本在 oled_hw.c 里，编译时加 -DOLED_USE_HW_I2C=1 就会切过去，
+   此时本文件整体被编译掉（两个版本符号名相同，不能同时参与链接；
+   字体表 oledfont.h 也是定义而不是声明，必须只被一个 .c 包含，否则重复定义）。
+   所以下面的 #if 必须包在 #include 之前。 */
+#if !OLED_USE_HW_I2C
+
 #include "oled.h"
 #include "oledfont.h"
 
@@ -37,6 +44,7 @@ static uint8_t s_oled_addr = OLED_ADDR_PRIMARY;
 volatile uint8_t  oled_addr_found = 0;   /* 0=两个地址都无应答 1=0x78 应答 2=0x7A 应答 */
 volatile uint32_t oled_ack_ok      = 0;  /* 收到 ACK 的字节数 */
 volatile uint32_t oled_ack_fail    = 0;  /* 未收到 ACK 的字节数 */
+volatile uint32_t oled_bus_err     = 0;  /* 软件版没有总线错误概念，恒为 0 */
 
 /* 位延时：72MHz 下约 2.5~3us，对应 SCL 约 150~180kHz，
    远低于 SSD1306 允许的 400kHz，避免时序过快导致模块不识别 */
@@ -251,3 +259,5 @@ void OLED_ShowString(uint8_t x, uint8_t page, const char *str)
     str++;
   }
 }
+
+#endif /* !OLED_USE_HW_I2C ---- 软件 I2C 版本结束 ---- */
