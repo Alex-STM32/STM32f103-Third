@@ -62,7 +62,14 @@ uint32_t last_tick  = 0;
 /* ---- 按键事件（中断置位，主循环清零）---- */
 volatile uint8_t  dir_event   = 0;
 volatile uint8_t  pause_event = 0;
-volatile uint32_t last_key_tick = 0;
+
+/* ---- 按键消抖：每个按键各自记录上次被接受的时间 ---- */
+volatile uint32_t last_dir_tick   = 0;
+volatile uint32_t last_pause_tick = 0;
+
+/* ---- 调试计数：记录每个按键"被接受"的中断次数（用于验证抖动是否已消除）---- */
+volatile uint32_t dir_cnt   = 0;
+volatile uint32_t pause_cnt = 0;
 
 /* ---- 串口数据包 ---- */
 CmdPacket        rx_packet;
@@ -356,13 +363,16 @@ static void MX_GPIO_Init(void)
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   uint32_t now = HAL_GetTick();
-  if (now - last_key_tick < 20) return;   /* 20ms 消抖 */
 
   if (GPIO_Pin == GPIO_PIN_11) {
-    last_key_tick = now;
+    if (now - last_dir_tick < 50) return;   /* 50ms 消抖：抖动产生的重复边沿直接丢弃 */
+    last_dir_tick = now;
+    dir_cnt++;
     dir_event = 1;
   } else if (GPIO_Pin == GPIO_PIN_12) {
-    last_key_tick = now;
+    if (now - last_pause_tick < 50) return;
+    last_pause_tick = now;
+    pause_cnt++;
     pause_event = 1;
   }
 }
