@@ -215,16 +215,21 @@ int main(void)
     char line[24];
     oled_dirty = 0;
 
+    /* 先清掉这一行的两块区域（字符占 2 页），再重画，避免旧字符残留 */
     snprintf(line, sizeof(line), "STATE: %s", run_flag ? "RUN" : "PAUSE");
+    OLED_ClearArea(0, 0, OLED_WIDTH, 1);
     OLED_ShowString(0, 0, line);
 
     snprintf(line, sizeof(line), "DIR: %s", dir_flag ? "REV" : "FWD");
+    OLED_ClearArea(0, 2, OLED_WIDTH, 3);
     OLED_ShowString(0, 2, line);
 
     snprintf(line, sizeof(line), "STEP: %ums", (unsigned int)interval_ms);
+    OLED_ClearArea(0, 4, OLED_WIDTH, 5);
     OLED_ShowString(0, 4, line);
 
     snprintf(line, sizeof(line), "LED: %u", (unsigned int)(led_index + 1));
+    OLED_ClearArea(0, 6, OLED_WIDTH, 7);
     OLED_ShowString(0, 6, line);
   }
 

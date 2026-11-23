@@ -22,15 +22,27 @@
 
 /* ---------------- 底层引脚操作 ---------------- */
 
+/* 两个引脚都配成开漏输出：写 1 = 释放总线（由上拉电阻拉高），写 0 = 拉低。
+   开漏的好处是可以直接读回线上真实电平，从而判断从机是否应答（ACK）。 */
 static void SDA_H(void) { HAL_GPIO_WritePin(OLED_SDA_PORT, OLED_SDA_PIN, GPIO_PIN_SET);   }
 static void SDA_L(void) { HAL_GPIO_WritePin(OLED_SDA_PORT, OLED_SDA_PIN, GPIO_PIN_RESET); }
 static void SCL_H(void) { HAL_GPIO_WritePin(OLED_SCL_PORT, OLED_SCL_PIN, GPIO_PIN_SET);   }
 static void SCL_L(void) { HAL_GPIO_WritePin(OLED_SCL_PORT, OLED_SCL_PIN, GPIO_PIN_RESET); }
+static uint8_t SDA_READ(void) { return (uint8_t)HAL_GPIO_ReadPin(OLED_SDA_PORT, OLED_SDA_PIN); }
 
-/* 位延时：72MHz 主频下约 0.6~0.8us，保证 SSD1306 的时序要求（>0.6us） */
+/* 从机地址：0x78（多数模块，A0 接地）/ 0x7A（少数模块，A0 接 VCC） */
+static uint8_t s_oled_addr = OLED_ADDR_PRIMARY;
+
+/* 诊断变量（可通过 SWD 读出，判断模块到底有没有应答） */
+volatile uint8_t  oled_addr_found = 0;   /* 0=两个地址都无应答 1=0x78 应答 2=0x7A 应答 */
+volatile uint32_t oled_ack_ok      = 0;  /* 收到 ACK 的字节数 */
+volatile uint32_t oled_ack_fail    = 0;  /* 未收到 ACK 的字节数 */
+
+/* 位延时：72MHz 下约 2.5~3us，对应 SCL 约 150~180kHz，
+   远低于 SSD1306 允许的 400kHz，避免时序过快导致模块不识别 */
 static void I2C_Delay(void)
 {
-  for (volatile uint8_t i = 0; i < 10; i++)
+  for (volatile uint16_t i = 0; i < 40; i++)
   {
     __NOP();
   }
@@ -59,9 +71,11 @@ static void I2C_Stop(void)
   I2C_Delay();
 }
 
-/* 发送一个字节（高位在前），第 9 个时钟释放 SDA（忽略 ACK） */
-static void I2C_WriteByte(uint8_t dat)
+/* 发送一个字节（高位在前），返回从机应答：0 = ACK（从机拉低），1 = NACK */
+static uint8_t I2C_WriteByte(uint8_t dat)
 {
+  uint8_t ack;
+
   for (uint8_t i = 0; i < 8; i++)
   {
     if (dat & 0x80) { SDA_H(); } else { SDA_L(); }
@@ -72,12 +86,18 @@ static void I2C_WriteByte(uint8_t dat)
     SCL_L();
     I2C_Delay();
   }
-  SDA_H();          /* 第 9 个时钟：主机释放 SDA，等从机应答 */
+
+  /* 第 9 个时钟：主机释放 SDA（开漏写 1），从机应答时会把 SDA 拉低 */
+  SDA_H();
   I2C_Delay();
   SCL_H();
   I2C_Delay();
+  ack = SDA_READ();   /* 0 = 从机拉低 = ACK */
   SCL_L();
   I2C_Delay();
+
+  if (ack == 0) oled_ack_ok++; else oled_ack_fail++;
+  return ack;
 }
 
 /* ---------------- SSD1306 命令/数据 ---------------- */
@@ -85,7 +105,8 @@ static void I2C_WriteByte(uint8_t dat)
 static void OLED_WriteCmd(uint8_t cmd)
 {
   I2C_Start();
-  I2C_WriteByte(0x00);   /* 控制字节：0x00 = 后续为命令 */
+  I2C_WriteByte(s_oled_addr);   /* 第一个字节必须是从机地址 + 写位 */
+  I2C_WriteByte(0x00);          /* 控制字节：0x00 = 后续为命令 */
   I2C_WriteByte(cmd);
   I2C_Stop();
 }
@@ -94,7 +115,8 @@ static void OLED_WriteCmd(uint8_t cmd)
 static void OLED_WriteDataBuf(const uint8_t *buf, uint16_t len)
 {
   I2C_Start();
-  I2C_WriteByte(0x40);   /* 控制字节：0x40 = 后续为显存数据 */
+  I2C_WriteByte(s_oled_addr);
+  I2C_WriteByte(0x40);          /* 控制字节：0x40 = 后续为显存数据 */
   for (uint16_t i = 0; i < len; i++)
   {
     I2C_WriteByte(buf[i]);
@@ -114,19 +136,40 @@ static void OLED_SetPos(uint8_t x, uint8_t page)
 
 void OLED_Init(void)
 {
-  /* PB0/PB1 作为普通推挽输出（CubeMX 未配置，这里自行初始化） */
+  /* PB0/PB1 作为普通开漏输出（CubeMX 未配置，这里自行初始化） */
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   GPIO_InitStruct.Pin   = OLED_SCL_PIN | OLED_SDA_PIN;
-  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_OD;   /* 开漏：可读回总线电平，判断 ACK */
+  GPIO_InitStruct.Pull  = GPIO_PULLUP;           /* 内部弱上拉（模块上还有 4.7k 外部上拉） */
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   SCL_H();
   SDA_H();
   HAL_Delay(100);          /* 等 OLED 上电稳定 */
+
+  /* ---- 探测从机地址：哪个地址有应答就用哪个 ---- */
+  I2C_Start();
+  if (I2C_WriteByte(OLED_ADDR_PRIMARY) == 0) {
+    s_oled_addr     = OLED_ADDR_PRIMARY;
+    oled_addr_found = 1;
+    I2C_Stop();
+  } else {
+    I2C_Stop();
+    HAL_Delay(2);
+    I2C_Start();
+    if (I2C_WriteByte(OLED_ADDR_ALT) == 0) {
+      s_oled_addr     = OLED_ADDR_ALT;
+      oled_addr_found = 2;
+    } else {
+      s_oled_addr     = OLED_ADDR_PRIMARY;
+      oled_addr_found = 0;   /* 两个都没应答：接线或供电问题 */
+    }
+    I2C_Stop();
+  }
+  HAL_Delay(2);
 
   /* SSD1306 初始化序列（128x64，页寻址模式） */
   OLED_WriteCmd(0xAE);     /* 关显示 */
