@@ -76,6 +76,11 @@ CmdPacket        rx_packet;
 volatile uint8_t packet_ready = 0;
 uint8_t          feedback_req = 0;
 
+/* ---- 串口收包统计（可通过 SWD 读出，用来区分"线没接"和"校验没过"）---- */
+volatile uint32_t uart_ok   = 0;   /* 收到并执行的合法包 */
+volatile uint32_t uart_bad  = 0;   /* 收到了 6 字节但校验/字段不合法 */
+volatile uint32_t uart_err  = 0;   /* UART 硬件错误（溢出 ORE 等）次数 */
+
 /* ---- 串口反馈 ---- */
 uint8_t          tx_msg[64];
 volatile uint8_t tx_busy = 0;
@@ -95,6 +100,16 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* 把一行字符串补齐到 16 个字符：一行 128 像素宽，8x16 字符宽 8 像素，正好 16 个。
+   补齐用空格，这样重画时整行都被覆盖，不需要先清屏（清屏要多写一倍数据，还慢）。 */
+static void oled_line_pad(char *s)
+{
+  uint8_t n = 0;
+  while (s[n] != '\0' && n < 16) { n++; }
+  while (n < 16) { s[n++] = ' '; }
+  s[n] = '\0';
+}
 
 /* USER CODE END 0 */
 
@@ -182,10 +197,18 @@ int main(void)
       interval_ms = p.step;
       feedback_req = 1;
       oled_dirty = 1;
-        }
+      uart_ok++;
+    } else {
+      uart_bad++;   /* 收到 6 字节但内容不合法，计数器留证据 */
+    }
 
-    /* 重新开启接收，等下一包 */
-    HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_packet, sizeof(rx_packet));
+    /* 重新开启接收，等下一包；如果 HAL 处于忙/错误态，先复位接收状态再重开，
+       否则一次溢出错误会让接收永久停摆（这就是刚才"发什么都不回"的原因） */
+    if (HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_packet, sizeof(rx_packet)) != HAL_OK) {
+      __HAL_UART_CLEAR_OREFLAG(&huart1);
+      huart1.RxState = HAL_UART_STATE_READY;
+      HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_packet, sizeof(rx_packet));
+    }
   }
 
   /* ---- 3. 流水灯推进（非阻塞）---- */
@@ -215,21 +238,21 @@ int main(void)
     char line[24];
     oled_dirty = 0;
 
-    /* 先清掉这一行的两块区域（字符占 2 页），再重画，避免旧字符残留 */
+    /* 每行补齐到 16 个字符后再画：整行被覆盖，旧内容不会残留，也不用额外清屏 */
     snprintf(line, sizeof(line), "STATE: %s", run_flag ? "RUN" : "PAUSE");
-    OLED_ClearArea(0, 0, OLED_WIDTH, 1);
+    oled_line_pad(line);
     OLED_ShowString(0, 0, line);
 
     snprintf(line, sizeof(line), "DIR: %s", dir_flag ? "REV" : "FWD");
-    OLED_ClearArea(0, 2, OLED_WIDTH, 3);
+    oled_line_pad(line);
     OLED_ShowString(0, 2, line);
 
     snprintf(line, sizeof(line), "STEP: %ums", (unsigned int)interval_ms);
-    OLED_ClearArea(0, 4, OLED_WIDTH, 5);
+    oled_line_pad(line);
     OLED_ShowString(0, 4, line);
 
     snprintf(line, sizeof(line), "LED: %u", (unsigned int)(led_index + 1));
-    OLED_ClearArea(0, 6, OLED_WIDTH, 7);
+    oled_line_pad(line);
     OLED_ShowString(0, 6, line);
   }
 
@@ -370,12 +393,12 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   uint32_t now = HAL_GetTick();
 
   if (GPIO_Pin == GPIO_PIN_11) {
-    if (now - last_dir_tick < 50) return;   /* 50ms 消抖：抖动产生的重复边沿直接丢弃 */
+    if (now - last_dir_tick < 100) return;   /* 100ms 消抖：抖动产生的重复边沿直接丢弃 */
     last_dir_tick = now;
     dir_cnt++;
     dir_event = 1;
   } else if (GPIO_Pin == GPIO_PIN_12) {
-    if (now - last_pause_tick < 50) return;
+    if (now - last_pause_tick < 100) return;
     last_pause_tick = now;
     pause_cnt++;
     pause_event = 1;
@@ -395,6 +418,19 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART1) {
     tx_busy = 0;
+  }
+}
+
+/* UART 出错（最常见是溢出 ORE：主机发得太快、上一包还没收完又来新字节）
+   必须在这里清错误标志并把接收重新挂起来，否则 HAL 会卡在 BUSY 状态，之后永远收不到数据 */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1) {
+    uart_err++;
+    __HAL_UART_CLEAR_OREFLAG(huart);
+    huart->ErrorCode = HAL_UART_ERROR_NONE;
+    huart->RxState = HAL_UART_STATE_READY;
+    HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_packet, sizeof(rx_packet));
   }
 }
 

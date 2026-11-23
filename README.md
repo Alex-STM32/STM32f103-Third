@@ -137,3 +137,39 @@ Third/
 烧录：ST-LINK V2 + OpenOCD（SWD：3.3V / GND / SWDIO / SWCLK），也可用 CLion 的 OpenOCD 运行配置。
 
 > 说明：链接脚本 `STM32F103C8TX_FLASH.ld` 中原有的 `(READONLY)` 段属性已被移除，因为本机 GCC 10.3.1 不支持该属性，否则链接会报 `non constant or forward reference` 错误。
+
+## 九、调试过程中修复的问题（真实排障记录）
+
+本工程不是"一次点亮"，下面四件事都真实发生过、并定位到根因后修复。记录在此，便于复现和对照。
+
+### 1. 烧录后 SWD 彻底连不上（调试口被代码关闭）
+
+CubeMX 生成工程时 SYS → Debug 保持默认 `No Debug`，于是 `stm32f1xx_hal_msp.c` 里生成了：
+
+```c
+__HAL_AFIO_REMAP_SWJ_DISABLE();   /* 上电即关闭 JTAG 和 SWD */
+```
+
+结果是"刚上电一瞬间能连、程序跑起来就永远连不上"。修复：改为 `__HAL_AFIO_REMAP_SWJ_NOJTAG()`（保留 SWD、关闭 JTAG），并把 `.ioc` 的 Debug 改为 `Serial Wire`。芯片已被锁住时，把 BOOT0 跳线帽挪到 `1`、按 RESET 进入出厂 bootloader（此时不跑用户程序、SWD 活着），全片擦除后重新烧入。
+
+### 2. 方向键一次按下被识别成两次
+
+现象：引脚电平明确被拉低（示波级证据：GPIOA IDR bit11 由 1 变 0），但 `dir_flag` 始终是 0。根因两点：原消抖窗口只有 20ms，这颗按钮触点重复闭合超过 20ms，一次按下产生两个下降沿（`dir_flag` 翻转两次又回到原值）；另外两个按键共用同一个时间戳，几乎同时按会互相吞掉事件。
+
+修复：每个按键各自记录上次被接受的时间，消抖窗口 100ms，抖动期内的重复边沿直接丢弃。
+
+### 3. OLED 全黑（软件 I²C 漏发从机地址）
+
+现象：接线正确、模块供电正常，但屏幕不亮。根因：`I2C_Start()` 之后直接发送控制字节 `0x00`，**从未发送 7 位从机地址 + 写位（`0x78`）**，模块收不到自己的地址就忽略后面所有内容。
+
+修复：每次传输先发地址；把 SDA/SCL 改为开漏输出以便读回总线电平判断 ACK；初始化时自动探测 `0x78` 与 `0x7A` 两个常见地址；位延时放慢到 SCL 约 150kHz。修复后统计到 23381 个字节全部被模块 ACK、0 次失败。
+
+### 4. 串口发几个包后彻底收不到数据
+
+现象：前两包能执行，之后无论发什么都无反应。根因：串口溢出（ORE）发生后 HAL 停留在 busy 状态，`HAL_UART_Receive_IT` 一直返回 `HAL_BUSY`，接收再也挂不起来。
+
+修复：增加 `HAL_UART_ErrorCallback`，出错时清 ORE 标志、复位 `RxState`、重新挂起接收；重挂失败时也先清错误再重试。同时增加 `uart_ok` / `uart_bad` / `uart_err` 三个计数器，用来区分"线没接（三个都不动）"和"收到了但校验不通过（`uart_bad` 增加）"。
+
+### 验证方法说明
+
+上述每一项都通过 SWD 直接读取芯片 RAM 中的变量核对，而不是只看现象：`interval_ms`、`run_flag`、`dir_flag`、`led_index`、`uart_ok/bad/err`、`oled_ack_ok/ack_fail`、以及 GPIO 输入寄存器 `GPIOx_IDR` 的实际电平。例如发送 `AA 00 01 C8 00 73` 后读回 `interval_ms = 0xC8 (200)`，即证明数据包被正确解析并执行。
